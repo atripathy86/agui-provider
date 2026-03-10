@@ -3,7 +3,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from python.helpers.extension import Extension
+from helpers.extension import Extension
 from agent import LoopData
 
 _plugin_root = Path(__file__).resolve().parents[3]

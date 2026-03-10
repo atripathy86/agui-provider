@@ -1,8 +1,8 @@
 """Auto-start the AG-UI server on first agent message loop."""
 import sys
 from pathlib import Path
-from python.helpers.extension import Extension
-from python.helpers import plugins
+from helpers.extension import Extension
+from helpers import plugins
 from agent import LoopData
 
 _plugin_root = Path(__file__).resolve().parents[3]

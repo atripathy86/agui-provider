@@ -1,7 +1,7 @@
 """Emit AG-UI StepFinished at end of each message loop iteration."""
 import sys
 from pathlib import Path
-from python.helpers.extension import Extension
+from helpers.extension import Extension
 from agent import LoopData
 
 _plugin_root = Path(__file__).resolve().parents[3]

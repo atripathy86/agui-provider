@@ -200,7 +200,7 @@ class AGUIServer:
         try:
             from agent import AgentContext, UserMessage, AgentContextType
             from initialize import initialize_agent
-            from python.helpers.persist_chat import remove_chat
+            from helpers.persist_chat import remove_chat
         except ImportError:
             return web.json_response(
                 {"error": {"message": "Agent runtime not available", "type": "server_error"}},
@@ -356,7 +356,7 @@ def _ensure_auth_token(config: dict) -> dict:
     config["auth_token"] = token
 
     try:
-        from python.helpers import plugins
+        from helpers import plugins
         # Load existing saved config, merge in the token, save back
         saved = plugins.get_plugin_config("agui-provider") or {}
         saved["auth_token"] = token

@@ -1,7 +1,7 @@
 """AG-UI provider status API handler."""
 import sys
 from pathlib import Path
-from python.helpers.api import ApiHandler, Request, Response
+from helpers.api import ApiHandler, Request, Response
 
 _plugin_root = Path(__file__).parent.parent
 if str(_plugin_root) not in sys.path:
@@ -45,7 +45,7 @@ class StatusHandler(ApiHandler):
         }
 
     async def _start(self) -> dict:
-        from python.helpers import plugins
+        from helpers import plugins
         from agui_helpers.agui_server import ensure_running
         config = plugins.get_plugin_config("agui-provider") or {}
         server = await ensure_running(config)
