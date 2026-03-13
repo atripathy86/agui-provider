@@ -1,4 +1,8 @@
-"""Emit AG-UI ToolCallStart + ToolCallArgs before tool execution."""
+"""Emit AG-UI ToolCallStart + ToolCallArgs before tool execution.
+
+For the 'response' tool, emits TEXT_MESSAGE_START instead of tool call events,
+since the response tool carries the user-facing text.
+"""
 import json
 import sys
 import uuid
@@ -14,12 +18,13 @@ if str(_plugin_root) not in sys.path:
 class AGUIToolStart(Extension):
     async def execute(self, loop_data: LoopData = LoopData(),
                       tool_name: str = "", tool_args: dict = None, **kwargs):
-        if not tool_name or tool_name == "response":
-            return  # Skip the "response" pseudo-tool
+        if not tool_name:
+            return
 
         from agui_helpers.agui_server import get_run_id_for_context
         from agui_helpers.event_bus import emit
         from agui_helpers.agui_events import (
+            encode_text_message_start,
             encode_text_message_end,
             encode_reasoning_message_end,
             encode_reasoning_end,
@@ -46,7 +51,16 @@ class AGUIToolStart(Extension):
             emit(run_id, encode_text_message_end(msg_id))
             state["text_started"] = False
 
-        # Generate tool call ID and emit start
+        if tool_name == "response":
+            # Response tool = user-facing text. Start a text message block.
+            msg_id = str(uuid.uuid4())
+            state["current_message_id"] = msg_id
+            state["text_started"] = True
+            self.agent._agui_state = state
+            emit(run_id, encode_text_message_start(msg_id, "assistant"))
+            return
+
+        # Regular tool -- emit tool call events
         tool_call_id = str(uuid.uuid4())
         state["current_tool_call_id"] = tool_call_id
         self.agent._agui_state = state
