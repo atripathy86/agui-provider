@@ -348,7 +348,13 @@ def _run_server_loop(loop: asyncio.AbstractEventLoop):
 
 
 def _ensure_auth_token(config: dict) -> dict:
-    """Generate and persist a secure auth token on first run if none is set."""
+    """Use AGUI_TOKEN env var if set, else use config value, else auto-generate."""
+    import os
+    env_token = os.environ.get("AGUI_TOKEN", "").strip()
+    if env_token:
+        config["auth_token"] = env_token
+        return config
+
     if config.get("auth_token"):
         return config
 
@@ -403,4 +409,34 @@ async def ensure_running(config: dict) -> AGUIServer:
         _server_instance.start(), _server_loop
     )
     future.result(timeout=10)  # Block until started (max 10s)
+    return _server_instance
+
+
+def ensure_running_sync(config: dict) -> AGUIServer:
+    """Synchronous entry point for startup extensions (no event loop required)."""
+    global _server_instance, _server_loop, _server_thread
+
+    config = _ensure_auth_token(config)
+
+    with _server_lock:
+        if _server_instance is None:
+            _server_instance = AGUIServer(config)
+
+    if _server_instance._running:
+        return _server_instance
+
+    if _server_loop is None or _server_loop.is_closed():
+        _server_loop = asyncio.new_event_loop()
+        _server_thread = threading.Thread(
+            target=_run_server_loop,
+            args=(_server_loop,),
+            daemon=True,
+            name="agui-server",
+        )
+        _server_thread.start()
+
+    future = asyncio.run_coroutine_threadsafe(
+        _server_instance.start(), _server_loop
+    )
+    future.result(timeout=10)
     return _server_instance
