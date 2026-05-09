@@ -13,9 +13,16 @@ import asyncio
 import hmac
 import json
 import logging
+import pathlib
 import secrets
 import threading
 import uuid
+
+import yaml
+
+_MODEL_CONFIG_DIR = pathlib.Path(__file__).parent.parent.parent / "_model_config"
+_PRESETS_FILE = _MODEL_CONFIG_DIR / "presets.yaml"
+_CONFIG_FILE = _MODEL_CONFIG_DIR / "config.json"
 
 from aiohttp import web
 from aiohttp.web import middleware
@@ -65,6 +72,10 @@ class AGUIServer:
         self.app.router.add_get("/health", self._health)
         self.app.router.add_post("/", self._handle_run)
         self.app.router.add_options("/", self._handle_options)
+        self.app.router.add_get("/api/presets", self._get_presets)
+        self.app.router.add_post("/api/presets", self._save_presets)
+        self.app.router.add_post("/api/presets/apply", self._apply_preset)
+        self.app.router.add_get("/api/model-config", self._get_model_config)
 
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
@@ -135,6 +146,60 @@ class AGUIServer:
 
     async def _handle_options(self, request: web.Request) -> web.Response:
         return self._cors_response(request)
+
+    async def _get_presets(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        try:
+            with open(_PRESETS_FILE, "r") as f:
+                presets = yaml.safe_load(f)
+            resp = web.json_response(presets)
+            self._add_cors_headers(resp, request)
+            return resp
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _save_presets(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        try:
+            body = await request.json()
+            with open(_PRESETS_FILE, "w") as f:
+                yaml.dump(body, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            resp = web.json_response({"status": "ok"})
+            self._add_cors_headers(resp, request)
+            return resp
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _apply_preset(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        try:
+            preset = await request.json()
+            with open(_CONFIG_FILE, "r") as f:
+                config = json.load(f)
+            config["chat_model"] = preset.get("chat", config.get("chat_model", {}))
+            config["utility_model"] = preset.get("utility", config.get("utility_model", {}))
+            with open(_CONFIG_FILE, "w") as f:
+                json.dump(config, f, indent=2)
+            resp = web.json_response({"status": "ok"})
+            self._add_cors_headers(resp, request)
+            return resp
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _get_model_config(self, request: web.Request) -> web.Response:
+        if not self._check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        try:
+            with open(_CONFIG_FILE, "r") as f:
+                config = json.load(f)
+            resp = web.json_response(config)
+            self._add_cors_headers(resp, request)
+            return resp
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_run(self, request: web.Request) -> web.StreamResponse:
         """Main AG-UI endpoint: accept RunAgentInput, stream SSE events."""
