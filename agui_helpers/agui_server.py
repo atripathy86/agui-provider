@@ -368,6 +368,9 @@ class AGUIServer:
                     f"for thread {thread_id[:8]}"
                 )
 
+                from helpers import message_queue as mq
+                mq.log_user_message(context, user_message, [], message_id=run_id)
+
                 task = context.communicate(UserMessage(user_message))
                 result = await task.result()
 
