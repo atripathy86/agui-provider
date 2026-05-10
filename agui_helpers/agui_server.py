@@ -7,6 +7,13 @@ CopilotKit and other AG-UI compatible frontends connect here.
 Threading model: The aiohttp server runs in the main event loop. Agent
 processing runs in DeferredTask threads (separate event loops). The event_bus
 uses stdlib queue.Queue for thread-safe communication between them.
+
+Session model: Each AG-UI threadId maps to a persistent AgentContext
+(type=USER) that lives across multiple sequential runs within the same
+conversation. Contexts are created on first request for a threadId and
+evicted after CONTEXT_IDLE_TTL_SECONDS of inactivity. Using USER type (not
+BACKGROUND) makes these conversations visible and interactive in A0's native
+web UI — a user can continue the same conversation from either interface.
 """
 
 import asyncio
@@ -17,6 +24,7 @@ import pathlib
 import secrets
 import threading
 import uuid
+from datetime import datetime, timezone
 
 import yaml
 
@@ -33,16 +41,24 @@ logger = logging.getLogger("agui-provider")
 MAX_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
 MAX_CONCURRENT_RUNS = 5
 
+# Evict contexts idle for longer than this
+CONTEXT_IDLE_TTL_SECONDS = 7200  # 2 hours
+
 _server_instance = None
 _server_lock = threading.Lock()
 
-# Module-level mapping: context_id → run_id
+# Module-level mapping: context_id → run_id (for extension callbacks)
 _context_run_map: dict[str, str] = {}
 _context_run_lock = threading.Lock()
 
 # Active runs: thread_id → run metadata
 _active_runs: dict[str, dict] = {}
 _active_runs_lock = threading.Lock()
+
+# Persistent contexts: thread_id → AgentContext (survives across turns)
+_thread_contexts: dict[str, "AgentContext"] = {}
+_thread_last_seen: dict[str, datetime] = {}
+_thread_contexts_lock = threading.Lock()
 
 
 class AGUIServer:
@@ -72,6 +88,8 @@ class AGUIServer:
         self.app.router.add_get("/health", self._health)
         self.app.router.add_post("/", self._handle_run)
         self.app.router.add_options("/", self._handle_options)
+        self.app.router.add_post("/reset", self._handle_reset)
+        self.app.router.add_options("/reset", self._handle_options)
         self.app.router.add_get("/api/presets", self._get_presets)
         self.app.router.add_post("/api/presets", self._save_presets)
         self.app.router.add_post("/api/presets/apply", self._apply_preset)
@@ -83,6 +101,9 @@ class AGUIServer:
         await site.start()
         self._running = True
         logger.info(f"AG-UI server listening on 0.0.0.0:{self.port}")
+
+        # Start background TTL eviction loop
+        asyncio.create_task(self._ttl_eviction_loop())
 
     async def stop(self):
         if self.runner:
@@ -106,31 +127,31 @@ class AGUIServer:
     def _add_cors_headers(self, response: web.Response, request: web.Request = None):
         origin = self.cors_origins
         if not origin:
-            # No CORS configured — don't add headers (same-origin only)
             return
         if origin == "*":
-            # Wildcard — reflect any origin
             response.headers["Access-Control-Allow-Origin"] = "*"
         else:
-            # Validate request origin against allowlist
             req_origin = request.headers.get("Origin", "") if request else ""
             allowed = [o.strip() for o in origin.split(",")]
             if req_origin in allowed:
                 response.headers["Access-Control-Allow-Origin"] = req_origin
                 response.headers["Vary"] = "Origin"
             else:
-                return  # Origin not allowed — don't add headers
+                return
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept"
         response.headers["Access-Control-Max-Age"] = "3600"
 
     async def _health(self, request: web.Request) -> web.Response:
         from agui_helpers.event_bus import get_active_runs
+        with _thread_contexts_lock:
+            active_threads = len(_thread_contexts)
         resp = web.json_response({
             "status": "ok",
             "protocol": "ag-ui",
             "version": "0.1.0",
             "active_runs": len(get_active_runs()),
+            "active_threads": active_threads,
             "running": self._running,
         })
         self._add_cors_headers(resp, request)
@@ -141,7 +162,6 @@ class AGUIServer:
             return True
         auth = request.headers.get("Authorization", "")
         expected = f"Bearer {self.auth_token}"
-        # Constant-time comparison to prevent timing attacks
         return hmac.compare_digest(auth.encode(), expected.encode())
 
     async def _handle_options(self, request: web.Request) -> web.Response:
@@ -201,6 +221,33 @@ class AGUIServer:
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
+    async def _handle_reset(self, request: web.Request) -> web.Response:
+        """Destroy the A0 context for a threadId. Called when the user starts a new chat."""
+        if not self._check_auth(request):
+            return web.json_response({"error": "Unauthorized"}, status=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        thread_id = body.get("threadId", "").strip()
+        if not thread_id:
+            return web.json_response({"error": "threadId is required"}, status=400)
+
+        context = _pop_thread_context(thread_id)
+        if context:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _destroy_context(context, thread_id)
+            )
+            logger.info(f"AG-UI: reset context for thread {thread_id[:8]}")
+            resp = web.json_response({"ok": True, "message": "Context reset"})
+        else:
+            resp = web.json_response({"ok": True, "message": "No active context for threadId"})
+
+        self._add_cors_headers(resp, request)
+        return resp
+
     async def _handle_run(self, request: web.Request) -> web.StreamResponse:
         """Main AG-UI endpoint: accept RunAgentInput, stream SSE events."""
         if not self._check_auth(request):
@@ -209,7 +256,6 @@ class AGUIServer:
                 status=401,
             )
 
-        # Enforce concurrent run limit
         with _active_runs_lock:
             if len(_active_runs) >= self.max_concurrent_runs:
                 return web.json_response(
@@ -235,9 +281,8 @@ class AGUIServer:
         messages = body.get("messages", [])
         tools = body.get("tools", [])
         state = body.get("state")
-        forwarded_props = body.get("forwardedProps", body.get("forwarded_props", {}))
 
-        # Extract user message from AG-UI messages
+        # Extract the latest user message from the full AG-UI message history
         user_message = ""
         for msg in reversed(messages):
             role = msg.get("role", "")
@@ -261,24 +306,20 @@ class AGUIServer:
                 status=400,
             )
 
-        # Import A0 internals
         try:
             from agent import AgentContext, UserMessage, AgentContextType
             from initialize import initialize_agent
-            from helpers.persist_chat import remove_chat
         except ImportError:
             return web.json_response(
                 {"error": {"message": "Agent runtime not available", "type": "server_error"}},
                 status=500,
             )
 
-        # Subscribe to events for this run (thread-safe stdlib queue)
         from agui_helpers.event_bus import subscribe, unsubscribe, emit, emit_finish
         from agui_helpers.agui_events import encode_run_started, encode_run_finished, encode_run_error
 
         queue = subscribe(run_id)
 
-        # Start SSE response
         response = web.StreamResponse(
             status=200,
             headers={
@@ -290,10 +331,8 @@ class AGUIServer:
         self._add_cors_headers(response, request)
         await response.prepare(request)
 
-        # Emit RunStarted
         emit(run_id, encode_run_started(thread_id, run_id))
 
-        # Store run metadata so extensions can find it
         with _active_runs_lock:
             _active_runs[thread_id] = {
                 "run_id": run_id,
@@ -302,18 +341,32 @@ class AGUIServer:
                 "state": state,
             }
 
-        # Kick off agent in background
         async def run_agent():
             context = None
+            is_new_context = False
             try:
-                # Create a fresh BACKGROUND context (same pattern as A2A handler)
-                cfg = initialize_agent()
-                context = AgentContext(cfg, type=AgentContextType.BACKGROUND)
+                # Look up or create a persistent context for this thread.
+                # USER type makes the conversation visible in A0's native web UI.
+                with _thread_contexts_lock:
+                    context = _thread_contexts.get(thread_id)
+                    if context is None:
+                        cfg = initialize_agent()
+                        short_id = thread_id[:8]
+                        context = AgentContext(
+                            cfg,
+                            type=AgentContextType.USER,
+                            name=f"AG-UI · {short_id}",
+                        )
+                        _thread_contexts[thread_id] = context
+                        is_new_context = True
+                    _thread_last_seen[thread_id] = datetime.now(timezone.utc)
 
-                # Register context_id → run_id mapping for extensions
                 register_run(context.id, run_id)
-
-                logger.info(f"AG-UI run {run_id}: context {context.id} created")
+                action = "created" if is_new_context else "resumed"
+                logger.info(
+                    f"AG-UI run {run_id[:8]}: context {context.id} {action} "
+                    f"for thread {thread_id[:8]}"
+                )
 
                 task = context.communicate(UserMessage(user_message))
                 result = await task.result()
@@ -322,41 +375,31 @@ class AGUIServer:
 
             except Exception as e:
                 logger.exception("Agent run failed")
-                # Sanitize: only send the exception class name, not full traceback
                 err_type = type(e).__name__
                 emit(run_id, encode_run_error(f"Agent error: {err_type}"))
             finally:
                 emit_finish(run_id)
                 with _active_runs_lock:
                     _active_runs.pop(thread_id, None)
-
-                # Clean up context (same pattern as A2A handler)
                 if context:
                     unregister_run(context.id)
-                    try:
-                        context.reset()
-                        AgentContext.remove(context.id)
-                        remove_chat(context.id)
-                    except Exception:
-                        logger.debug(f"Context cleanup error for {context.id}", exc_info=True)
+                # Context is intentionally kept alive for subsequent turns.
+                # It will be evicted by TTL or explicitly reset via POST /reset.
 
         agent_task = asyncio.create_task(run_agent())
 
-        # Stream events from thread-safe queue to SSE
         loop = asyncio.get_event_loop()
         try:
             while True:
                 try:
-                    # Read from stdlib queue in executor (non-blocking for event loop)
                     event = await loop.run_in_executor(
                         None, lambda: queue.get(timeout=30.0)
                     )
                 except Exception:
-                    # queue.Empty on timeout — send keepalive
                     await response.write(b": keepalive\n\n")
                     continue
 
-                if event is None:  # Sentinel — run finished
+                if event is None:
                     break
 
                 await response.write(event.encode("utf-8"))
@@ -368,10 +411,54 @@ class AGUIServer:
 
         try:
             await response.write_eof()
-        except (ConnectionResetError, ConnectionAbortedError, Exception):
-            pass  # Client already gone
+        except Exception:
+            pass
         return response
 
+    async def _ttl_eviction_loop(self):
+        """Periodically evict AgentContexts idle for longer than CONTEXT_IDLE_TTL_SECONDS."""
+        while self._running:
+            await asyncio.sleep(600)  # check every 10 minutes
+            now = datetime.now(timezone.utc)
+            to_evict = []
+
+            with _thread_contexts_lock:
+                for tid, last_seen in list(_thread_last_seen.items()):
+                    if (now - last_seen).total_seconds() > CONTEXT_IDLE_TTL_SECONDS:
+                        to_evict.append(tid)
+
+            for tid in to_evict:
+                context = _pop_thread_context(tid)
+                if context:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda ctx=context, t=tid: _destroy_context(ctx, t)
+                    )
+                    logger.info(f"AG-UI: TTL-evicted idle context for thread {tid[:8]}")
+
+
+# ── Thread-context helpers ──────────────────────────────────────────────────
+
+def _pop_thread_context(thread_id: str) -> "AgentContext | None":
+    """Remove and return the context for a thread (None if not present)."""
+    with _thread_contexts_lock:
+        context = _thread_contexts.pop(thread_id, None)
+        _thread_last_seen.pop(thread_id, None)
+    return context
+
+
+def _destroy_context(context: "AgentContext", thread_id: str):
+    """Tear down an AgentContext. Safe to call from any thread."""
+    try:
+        from agent import AgentContext
+        from helpers.persist_chat import remove_chat
+        context.reset()
+        AgentContext.remove(context.id)
+        remove_chat(context.id)
+    except Exception:
+        logger.debug(f"Context cleanup error for thread {thread_id[:8]}", exc_info=True)
+
+
+# ── Run-ID ↔ context-ID mapping (used by extension hooks) ──────────────────
 
 def register_run(context_id: str, run_id: str):
     """Register context_id → run_id mapping. Called before communicate()."""
@@ -396,10 +483,10 @@ def get_active_run_ids() -> list[str]:
         return [m["run_id"] for m in _active_runs.values()]
 
 
-# Module-level server management
+# ── Server lifecycle ────────────────────────────────────────────────────────
 
-_server_loop = None  # Dedicated event loop for aiohttp
-_server_thread = None  # Background thread running the loop
+_server_loop = None
+_server_thread = None
 
 
 def get_server() -> AGUIServer | None:
@@ -407,13 +494,11 @@ def get_server() -> AGUIServer | None:
 
 
 def _run_server_loop(loop: asyncio.AbstractEventLoop):
-    """Run the dedicated event loop in a background thread."""
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
 
 def _ensure_auth_token(config: dict) -> dict:
-    """Use AGUI_TOKEN env var if set, else use config value, else auto-generate."""
     import os
     env_token = os.environ.get("AGUI_TOKEN", "").strip()
     if env_token:
@@ -428,7 +513,6 @@ def _ensure_auth_token(config: dict) -> dict:
 
     try:
         from helpers import plugins
-        # Load existing saved config, merge in the token, save back
         saved = plugins.get_plugin_config("agui-provider") or {}
         saved["auth_token"] = token
         plugins.save_plugin_config("agui-provider", "", "", saved)
@@ -440,15 +524,8 @@ def _ensure_auth_token(config: dict) -> dict:
 
 
 async def ensure_running(config: dict) -> AGUIServer:
-    """Start the AG-UI server in a dedicated background thread.
-
-    aiohttp needs a persistent event loop. Flask/Starlette request handlers
-    have transient async contexts, so we spin up a dedicated thread with its
-    own loop that stays alive for the lifetime of the process.
-    """
     global _server_instance, _server_loop, _server_thread
 
-    # Generate auth token on first run if not configured
     config = _ensure_auth_token(config)
 
     with _server_lock:
@@ -458,7 +535,6 @@ async def ensure_running(config: dict) -> AGUIServer:
     if _server_instance._running:
         return _server_instance
 
-    # Create a dedicated event loop + thread
     if _server_loop is None or _server_loop.is_closed():
         _server_loop = asyncio.new_event_loop()
         _server_thread = threading.Thread(
@@ -469,16 +545,14 @@ async def ensure_running(config: dict) -> AGUIServer:
         )
         _server_thread.start()
 
-    # Schedule server.start() on the dedicated loop and wait for it
     future = asyncio.run_coroutine_threadsafe(
         _server_instance.start(), _server_loop
     )
-    future.result(timeout=10)  # Block until started (max 10s)
+    future.result(timeout=10)
     return _server_instance
 
 
 def ensure_running_sync(config: dict) -> AGUIServer:
-    """Synchronous entry point for startup extensions (no event loop required)."""
     global _server_instance, _server_loop, _server_thread
 
     config = _ensure_auth_token(config)
